@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-if torch.backends.mps.is_available():
+if torch.backends.mps.is_available() and False:
     mps_device = torch.device("mps")
     x = torch.ones(1, device=mps_device)
     print (x)
@@ -37,8 +37,10 @@ torch.manual_seed(1337)
 # Hyperparameters
 batch_size = 4
 block_size = 8
-train_iter = 30000
+train_iter = 5000
 loss_iter = 10
+n_embd = 32
+lr=1e-3
 
 # helper function to get batch
 def get_batch(split):
@@ -80,30 +82,81 @@ def get_loss():
     m.train()
     return out
 
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.ReLU(),
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+    
+    def forward(self, x):
+        return torch.cat([head(x) for head in self.heads], dim=-1)
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+    
+    def forward(self, x):
+        B, T, C  = x.shape
+        k = self.key(x) # B, T, 
+        q = self.query(x)
+        v = self.value(x)
+        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        out = wei @ v
+        return out
 
 class SmallLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.sa_heads = MultiHeadedAttention(4, (n_embd//4))
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.ffwd = FeedForward(n_embd)
     
-    def forward(self, x, targets):
+    def forward(self, x, targets=None):
         x = x.to(mps_device)
-        targets = targets.to(mps_device)
-        logits = self.token_embedding_table(x)
-        B,T,C = logits.shape
-        logits = logits.view(B*T, C)
-        targets = targets.view(B*T)
-        loss = F.cross_entropy(logits, targets)
+        B, T = x.shape
+        tok_emb = self.token_embedding_table(x) #B, T, C (C is n_embd)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=mps_device))
+        x = tok_emb + pos_emb
+        x = self.sa_heads(x)
+        x = self.ffwd(x)
+        logits = self.lm_head(x) #B, T, C (C is vocab_size)
+        if targets is None:
+            loss = None
+        else:
+            targets = targets.to(mps_device)
+            B,T,C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
         return logits, loss
     
     def generate(self, start, num_samples):
         start = start.to(mps_device)
         for _ in range(num_samples):
-            logits = self.token_embedding_table(start)
+            modified_start = start[:, -block_size:] # crop the input till block size
+            logits, loss = self(modified_start)
             logits = logits [:,-1,:] # look at just the last time channel for Bigram model
             probs = F.softmax(logits, dim=-1)
             next_idx = torch.multinomial(probs, num_samples=1)
-            start = torch.cat((start, next_idx), dim=-1)
+            start = torch.cat((start, next_idx), dim=1)
         return ''.join(decode(start.tolist()[0]))
     
 m = SmallLanguageModel()
@@ -113,7 +166,7 @@ start = torch.zeros((1,1), dtype=torch.long, device=mps_device)
 num_samples = 100
 # expected initial loss = -ln(1/65)
 
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(m.parameters(), lr=lr)
 
 # training the model
 for i in range(train_iter):
